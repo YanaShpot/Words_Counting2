@@ -23,16 +23,7 @@
 
 using namespace std;
 
-//deque<vector<string>> d;
-condition_variable cv;
-mutex mtx;
-atomic<bool> done { false };
-atomic<bool> isPartitionDone{ false };
-
-condition_variable assemblyCv;
-mutex assemblerMtx;
-
-int producer(string filename, deque<vector<string>>& d)
+int producer(string filename, deque<vector<string>>& d, std::mutex& mtx, atomic<bool>& done, condition_variable& cv)
 {
     const uint64_t block_size = 100;
     const uint64_t max_line_size = 500;
@@ -96,18 +87,10 @@ static inline std::string &trim(std::string &s) {
 bool isAlnum(string& str)
 {
     str = trim(str);
-
-    //auto size = str.size();
-    //for (int i = 0; i < size; ++i)
-    //{
-    //	if (!std::isalnum(str[i]))
-    //		str[i] = ' ';
-    //}
-
     return str.size() != 0;
 }
 
-int consumer(int rank, deque<vector<string>>& d, deque<unordered_map<string, uint64_t>>& asseblyDeque)
+int consumer(int rank, deque<vector<string>>& d, deque<unordered_map<string, uint64_t>>& asseblyDeque, std::mutex& mtx, std::atomic<bool>& done, condition_variable& cv, condition_variable& assemblyCv, mutex& assemblerMtx)
 {
     int i = 0;
     while (true)
@@ -170,7 +153,7 @@ auto flip_pair(const pair<string, uint64_t> &p)
 }
 
 
-int Assembly(map<string, uint64_t>& mergedwarehouse, deque<unordered_map<string, uint64_t>>& asseblyDeque)
+int Assembly(map<string, uint64_t>& mergedwarehouse, deque<unordered_map<string, uint64_t>>& asseblyDeque, std::atomic<bool>& isPartitionDone, condition_variable& assemblyCv, mutex& assemblerMtx)
 {
     while (true)
     {
@@ -234,6 +217,14 @@ void FlushToFile(string outDir, bool isSortedByName, T& mergedWarehouse)
 
 int main()
 {
+    mutex mtx;
+    atomic<bool> done { false };
+    atomic<bool> isPartitionDone{ false };
+    condition_variable cv;
+    condition_variable assemblyCv;
+    mutex assemblerMtx;
+
+
     map<string, uint64_t> mergedwarehouse;
     deque<vector<string>> d;
     deque<unordered_map<string, uint64_t>> asseblyDeque;
@@ -241,13 +232,13 @@ int main()
     //warehouses.resize(4);
     thread thr1 = thread(producer,
                          "/Users/Yasya/Desktop/Results/The_H_G.txt",
-                         std::ref(d));
-    thread thr2 = thread(consumer, 0, std::ref(d), std::ref(asseblyDeque));
-    thread thr3 = thread(consumer, 1, std::ref(d), std::ref(asseblyDeque));
-    thread thr4 = thread(consumer, 2, std::ref(d), std::ref(asseblyDeque));
-    thread thr5 = thread(consumer, 3, std::ref(d), std::ref(asseblyDeque));
+                         std::ref(d), std::ref(mtx),std::ref(done), std::ref(cv));
+    thread thr2 = thread(consumer, 0, std::ref(d), std::ref(asseblyDeque), std::ref(mtx), std::ref(done), std::ref(cv), std::ref(assemblyCv), std::ref(assemblerMtx));
+    thread thr3 = thread(consumer, 1, std::ref(d), std::ref(asseblyDeque), std::ref(mtx), std::ref(done), std::ref(cv), std::ref(assemblyCv), std::ref(assemblerMtx));
+    thread thr4 = thread(consumer, 2, std::ref(d), std::ref(asseblyDeque), std::ref(mtx), std::ref(done), std::ref(cv), std::ref(assemblyCv), std::ref(assemblerMtx));
+    thread thr5 = thread(consumer, 3, std::ref(d), std::ref(asseblyDeque), std::ref(mtx), std::ref(done), std::ref(cv), std::ref(assemblyCv), std::ref(assemblerMtx));
 
-    thread thrAssembler = thread(Assembly, std::ref(mergedwarehouse), std::ref(asseblyDeque));
+    thread thrAssembler = thread(Assembly, std::ref(mergedwarehouse), std::ref(asseblyDeque), std::ref(isPartitionDone), std::ref(assemblyCv), std::ref(assemblerMtx));
     //thread thr4 = thread(consumer, 2);
     thr1.join();
     thr2.join();
