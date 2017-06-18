@@ -23,6 +23,7 @@
 
 using namespace std;
 
+
 int producer(string filename, deque<vector<string>>& d, std::mutex& mtx, atomic<bool>& done, condition_variable& cv)
 {
     const uint64_t block_size = 100;
@@ -144,8 +145,6 @@ int consumer(int rank, deque<vector<string>>& d, deque<unordered_map<string, uin
 
     return 0;
 }
-
-
 
 auto flip_pair(const pair<string, uint64_t> &p)
 {
