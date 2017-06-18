@@ -16,40 +16,41 @@
 #include <sstream>
 #include <iterator>
 
+#include <algorithm>
+#include <functional>
+#include <cctype>
+#include <locale>
+
 using namespace std;
 
-deque<vector<string>> d;
+//deque<vector<string>> d;
 condition_variable cv;
 mutex mtx;
 atomic<bool> done { false };
-const uint64_t block_size = 100;
-vector<unordered_map<string, uint64_t> > WarehouseS;
-multimap<uint64_t, string> MergedWarehouseByCount;
-map<string, uint64_t> MergedWarehouse;
+atomic<bool> isPartitionDone{ false };
 
-streampos FileEnd(ifstream& file)
+condition_variable assemblyCv;
+mutex assemblerMtx;
+
+int producer(string filename, deque<vector<string>>& d)
 {
-    file.seekg(0, file.end);
-    streampos end = file.tellg();
-    file.seekg(0, file.beg);
+    const uint64_t block_size = 100;
+    const uint64_t max_line_size = 500;
 
-    return end;
-}
-
-int producer(string fileName)
-{
-    ifstream file(fileName);
+    ifstream file(filename);
     if (!file.is_open())
         return 1;
 
-    streampos end = FileEnd(file);
-    while (file.tellg() != end)
+    file.seekg(3);
+    while (true)
     {
         string line;
         vector<string> lines;
 
         for (size_t line_index = 0; getline(file, line) && line_index < block_size; ++line_index)
         {
+            int mod = line.size() / max_line_size;
+            line_index += mod;
             lines.push_back(line);
         }
 
@@ -71,17 +72,42 @@ int producer(string fileName)
     return 0;
 }
 
-bool isAlnum(string str)
-{
-    auto it = std::find_if(std::begin(str), std::end(str), [](char c)
-    {
-        return c < 0 || !isalnum(c);
-    });
 
-    return it == std::end(str);
+// trim from start
+static inline std::string &ltrim(std::string &s) {
+    s.erase(s.begin(), std::find_if(s.begin(), s.end(),
+                                    std::ptr_fun<int, int>(std::isalnum)));
+    return s;
 }
 
-int consumer(int rank)
+// trim from end
+static inline std::string &rtrim(std::string &s) {
+    s.erase(std::find_if(s.rbegin(), s.rend(),
+                         std::ptr_fun<int, int>(std::isalnum)).base(), s.end());
+    return s;
+}
+
+// trim from both ends
+static inline std::string &trim(std::string &s) {
+    return ltrim(rtrim(s));
+}
+
+
+bool isAlnum(string& str)
+{
+    str = trim(str);
+
+    //auto size = str.size();
+    //for (int i = 0; i < size; ++i)
+    //{
+    //	if (!std::isalnum(str[i]))
+    //		str[i] = ' ';
+    //}
+
+    return str.size() != 0;
+}
+
+int consumer(int rank, deque<vector<string>>& d, deque<unordered_map<string, uint64_t>>& asseblyDeque)
 {
     int i = 0;
     while (true)
@@ -90,11 +116,14 @@ int consumer(int rank)
         if (!d.empty())
         {
             ++i;
+            cout << "rank = " << rank << ", iter = " << i << endl;
             vector<string> wordS{(vector<string> &&) d.front()};  //take our data
             d.pop_front();
             lk.unlock();
 
-            auto& warehouse = WarehouseS[rank];
+            unordered_map<string, uint64_t> warehouse;
+
+            //auto& warehouse = WarehouseS[rank];
             for(int i = 0; i < wordS.size(); ++i)
             {
                 istringstream iss(wordS[i]);
@@ -110,6 +139,12 @@ int consumer(int rank)
                     }
                 }
             }
+            {
+                lock_guard<mutex> lg(assemblerMtx);
+                asseblyDeque.push_back(warehouse);
+            }
+
+            assemblyCv.notify_one();
         }
         else
         {
@@ -128,38 +163,61 @@ int consumer(int rank)
 }
 
 
-void MergeByName()
-{
-    MergedWarehouse.clear();
-    for (auto hashTable : WarehouseS)
-    {
-        for (auto word : hashTable)
-        {
-            MergedWarehouse[word.first] += word.second;
-        }
-    }
-}
 
 auto flip_pair(const pair<string, uint64_t> &p)
 {
     return pair<uint64_t, string>(p.second, p.first);
 }
 
-void MergeByCount()
-{
-    MergeByName();
 
-    MergedWarehouseByCount.clear();
-    std::transform(MergedWarehouse.begin(), MergedWarehouse.end(),
-                   std::inserter(MergedWarehouseByCount, MergedWarehouseByCount.begin()),
+int Assembly(map<string, uint64_t>& mergedwarehouse, deque<unordered_map<string, uint64_t>>& asseblyDeque)
+{
+    while (true)
+    {
+        unique_lock<std::mutex> lk(assemblerMtx);
+        if (!asseblyDeque.empty())
+        {
+            std::unordered_map<string, uint64_t> partition {(unordered_map<string, uint64_t> &&) asseblyDeque.front()};
+            asseblyDeque.pop_front();
+            lk.unlock();
+
+            for (auto pair : partition)
+            {
+                mergedwarehouse[pair.first] += pair.second;
+            }
+        }
+        else
+        {
+            if (isPartitionDone)
+            {
+                break;
+            }
+            else
+            {
+                assemblyCv.wait(lk);
+            }
+        }
+    }
+
+    return 0;
+}
+
+
+
+void MergeByCount(map<string, uint64_t>& mergedWarehouse, multimap<uint64_t, string>& mergedWarehouseByCount)
+{
+//	mergebyname();
+
+    mergedWarehouseByCount.clear();
+    std::transform(mergedWarehouse.begin(), mergedWarehouse.end(),
+                   std::inserter(mergedWarehouseByCount, mergedWarehouseByCount.begin()),
                    flip_pair);
 }
 
 template <typename T>
 void FlushToFile(string outDir, bool isSortedByName, T& mergedWarehouse)
 {
-    // string fileName = isSortedByName ? "res_a.txt" : "res_n.txt";
-    // ofstream out(m_outDir + fileName, ios::trunc);
+
     ofstream out(outDir, ios::trunc);
     out.width(20);
     if (isSortedByName)
@@ -176,24 +234,33 @@ void FlushToFile(string outDir, bool isSortedByName, T& mergedWarehouse)
 
 int main()
 {
-    WarehouseS.resize(2);
+    map<string, uint64_t> mergedwarehouse;
+    deque<vector<string>> d;
+    deque<unordered_map<string, uint64_t>> asseblyDeque;
+
+    //warehouses.resize(4);
     thread thr1 = thread(producer,
-                         "/Users/Yasya/Desktop/Results/The_H_G.txt");
-    thread thr2 = thread(consumer, 0);
-    thread thr3 = thread(consumer, 1);
+                         "/Users/Yasya/Desktop/Results/The_H_G.txt",
+                         std::ref(d));
+    thread thr2 = thread(consumer, 0, std::ref(d), std::ref(asseblyDeque));
+    thread thr3 = thread(consumer, 1, std::ref(d), std::ref(asseblyDeque));
+    thread thr4 = thread(consumer, 2, std::ref(d), std::ref(asseblyDeque));
+    thread thr5 = thread(consumer, 3, std::ref(d), std::ref(asseblyDeque));
+
+    thread thrAssembler = thread(Assembly, std::ref(mergedwarehouse), std::ref(asseblyDeque));
+    //thread thr4 = thread(consumer, 2);
     thr1.join();
     thr2.join();
     thr3.join();
+    thr4.join();
+    thr5.join();
+    isPartitionDone = true;
+    assemblyCv.notify_one(); //щоб уникнути дедлоку
+    thrAssembler.join();
 
-    bool sort_by_name = false;
-    if (sort_by_name)
-    {
-        MergeByName();
-        FlushToFile("text.txt", true, MergedWarehouse);
-    }
-    else
-    {
-        MergeByCount();
-        FlushToFile("text.txt", false, MergedWarehouseByCount);
-    }
+    FlushToFile("textN.txt", true, mergedwarehouse);
+
+    multimap<uint64_t, string> mergedWarehouseByCount;
+    MergeByCount(mergedwarehouse, mergedWarehouseByCount);
+    FlushToFile("textC.txt", false, mergedWarehouseByCount);
 }
